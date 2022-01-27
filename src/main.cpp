@@ -433,8 +433,6 @@ void setup()
 // loop
 void loop()
 {
-    WiFiClient newClient;
-
     // check serial input
     if (Serial.available() > 0) {
         // read byte
@@ -483,7 +481,7 @@ void loop()
 
     // check new connection
     if (server != nullptr) {
-        newClient = server->available();
+        WiFiClient newClient = server->available();
 
         if (newClient) {
             // search first free client slot
