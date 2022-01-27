@@ -1,3 +1,10 @@
+/* 
+ * MSR23 ESP12 modem firmware
+ * (C) 2021 Raman Shyhniou
+ *
+ * This code is licenced under the GPL.
+ */
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPUpdateServer.h>
@@ -20,7 +27,7 @@ struct creds {
 // firmware update password <ip>:8080/firmware
 const char* fwpw = "AHU_8266";
 
-// rtc user memory storage: one integer
+// rtc user memory storage
 #define RTC_BASE 32
 struct rtc_storage {
     uint8_t magic[3];  // RUM
@@ -32,6 +39,7 @@ struct rtc_storage {
 } __attribute__((packed, aligned(4)));
 
 // servers
+int server_port = 0;
 WiFiServer *server = nullptr;
 ESP8266WebServer httpServer(8080);
 ESP8266HTTPUpdateServer httpUpdater;
@@ -39,6 +47,7 @@ ESP8266HTTPUpdateServer httpUpdater;
 // clients
 #define MAX_CLIENTS 16
 WiFiClient *client[MAX_CLIENTS] = { nullptr };
+int connected = 0;
 
 // stats buffer
 char buffer[2048];
@@ -62,7 +71,7 @@ struct history {
 
 
 // rtc user memory write
-bool rtc_usermem_set(int32_t data)
+static bool rtc_usermem_set(int32_t data)
 {
     struct rtc_storage d = {
         .magic = {'R','U','M'},
@@ -77,7 +86,7 @@ bool rtc_usermem_set(int32_t data)
 
 
 // rtc user memory read
-bool rtc_usermem_get(int32_t *data)
+static bool rtc_usermem_get(int32_t *data)
 {
     struct rtc_storage d;
     uint8_t csum;
@@ -101,7 +110,7 @@ bool rtc_usermem_get(int32_t *data)
 
 
 // 64bit millis() implementation
-uint64_t millis64(void)
+static uint64_t millis64(void)
 {
     static uint32_t low32 = 0, high32 = 0;
     uint32_t new_low32 = millis();
@@ -112,7 +121,7 @@ uint64_t millis64(void)
 
 
 // calculate crc for ssid + password
-uint16_t creds_crc(struct creds *creds)
+static uint16_t creds_crc(struct creds *creds)
 {
     uint16_t crc = 0;
     unsigned i;
@@ -128,7 +137,7 @@ uint16_t creds_crc(struct creds *creds)
 
 
 // close all client connections and stop server
-void stop_server()
+static void server_stop()
 {
     // close all client connections...
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -147,13 +156,17 @@ void stop_server()
         server = nullptr;
     }
 
+    // reset connected clients count and server port
+    server_port = 0;
+    connected = 0;
+
     // update port in rtc user memory
     rtc_usermem_set(0);
 }
 
 
 // process AT command
-void process_command(char *command, size_t len)
+static void process_command(char *command, size_t len)
 {
     if (len == 0)
         return;
@@ -174,7 +187,7 @@ void process_command(char *command, size_t len)
 
     // reset
     if (!strcmp(command, "AT+RST")) {
-        stop_server();
+        server_stop();
         Serial.print(F("\r\nOK\r\n...bla-bla-bla...\r\nready\r\n"));
         return;
     }
@@ -187,10 +200,27 @@ void process_command(char *command, size_t len)
     if (!strcmp(command, "AT+CIPMUX=1"))
         goto ok;
 
-    // qeury ap
+    // check AP
     if (!strcmp(command, "AT+CWJAP?")) {
         if (WiFi.isConnected()) {
-            Serial.printf("+CWJAP:\"%s\"\r\n", creds.ssid);
+            char *dst, *src;
+            char buf[80];
+
+            strcpy_P(buf, PSTR("+CWJAP:\""));
+
+            src = creds.ssid;
+            dst = buf + 8;
+
+            while (*src != '\0') {
+                if (*src == '"' || *src == ',' || *src == '\\')
+                    *dst++ = '\\';
+                *dst++ = *src++;
+            }
+
+            *dst = '\0';
+            strcat_P(dst, PSTR("\"\r\n"));
+
+            Serial.print(buf);
             goto ok;
         } else {
             Serial.print(F("No AP\r\n"));
@@ -225,7 +255,7 @@ void process_command(char *command, size_t len)
         *dst = '\0';
 
         // hide password in history
-        strcpy(history->buffer + (src - command), "*\"");
+        strcpy_P(history->buffer + (src - command), PSTR("*\""));
 
         // parse password
         dst = pass;
@@ -280,13 +310,14 @@ void process_command(char *command, size_t len)
         r = sscanf(command + 13, "%d,%d", &cmd, &port);
 
         if (r > 0 && cmd == 0) {
-            stop_server();
+            server_stop();
             goto ok;
         }
 
         if (r == 2 && cmd == 1 && port > 0 && port < 65536 && port != 8080 && server == nullptr) {
             server = new WiFiServer(port);
             rtc_usermem_set(port);
+            server_port = port;
             server->begin();
             goto ok;
         }
@@ -303,7 +334,7 @@ void process_command(char *command, size_t len)
 
         if (n < 0 || n >= MAX_CLIENTS)
             goto error;
-        
+
         if (client[n] == nullptr) {
             Serial.print(F("link is not\r\n"));
             goto error;
@@ -313,6 +344,7 @@ void process_command(char *command, size_t len)
         delete client[n];
         client[n] = nullptr;
         Serial.printf("%d,CLOSED\r\n", n);
+        connected--;
 
         goto ok;
     }
@@ -355,10 +387,9 @@ ok:
 // handle / page
 void handle_root()
 {
-    char buf[24];
-    int i;
+    size_t i;
 
-    strcpy_P(buffer, PSTR("MSR23 WiFi ModBus modem\n\nAT history:\n"));
+    strcpy_P(buffer, PSTR("MSR23 WiFi modem\n\nAT history:\n"));
 
     for (i = 0; i < HISTSIZE; i++) {
         history = history->next;
@@ -367,18 +398,13 @@ void handle_root()
         strcat(buffer, "\n");
     }
 
-    strcat_P(buffer, PSTR("\nRSSI: "));
-    snprintf(buf, sizeof(buf), "%d", WiFi.RSSI());
-    strcat(buffer, buf);
+    i = strlen(buffer);
+    i += snprintf(buffer + i, sizeof(buffer) - i,
+        "\nConnected: %d\nServer port: %d\n\nRSSI: %d\nUptime: %llu sec\nReset reason: %s",
+        connected, server_port, WiFi.RSSI(), millis64() / 1000, ESP.getResetReason().c_str()
+    );
 
-    strcat_P(buffer, PSTR(", uptime: "));
-    snprintf(buf, sizeof(buf), "%llu", millis64() / 1000);
-    strcat(buffer, buf);
-
-    strcat_P(buffer, PSTR(" sec, reset reason: "));
-    strcat(buffer, ESP.getResetReason().c_str());
-
-    httpServer.send(200, "text/plain", buffer, strlen(buffer));
+    httpServer.send(200, "text/plain", buffer, i);
 }
 
 
@@ -421,6 +447,7 @@ void setup()
     if (rtc_usermem_get(&port) && port > 0) {
         // spurious reset?
         server = new WiFiServer(port);
+        server_port = port;
         server->begin();
     }
 
@@ -484,14 +511,20 @@ void loop()
         WiFiClient newClient = server->available();
 
         if (newClient) {
+            int i;
+
             // search first free client slot
-            for (int i = 0 ; i < MAX_CLIENTS; i++) {
+            for (i = 0 ; i < MAX_CLIENTS; i++) {
                 if (nullptr == client[i]) {
                     client[i] = new WiFiClient(newClient);
                     Serial.printf("%d,CONNECT\r\n", i);
+                    connected++;
                     break;
                 }
             }
+
+            if (i == MAX_CLIENTS)
+                newClient.stop();
         }
     }
 
@@ -515,6 +548,7 @@ void loop()
                 send_len = 0;
                 send_to = -1;
             }
+            connected--;
             continue;
         }
 
