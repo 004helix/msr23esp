@@ -52,8 +52,9 @@ int connected = 0;
 // stats buffer
 char buffer[2048];
 
-// at commands buffer
+// at command buffer
 char input_buffer[2048];
+int input_len = sizeof(input_buffer);
 int input_pos = 0;
 
 // at+cipsend buffer
@@ -365,7 +366,7 @@ static void process_command(char *command, size_t len)
         }
 
         if (len > (int)sizeof(send_buffer)) {
-            Serial.print(F("tool long\r\n"));
+            Serial.print(F("too long\r\n"));
             return;
         }
 
@@ -461,44 +462,63 @@ void setup()
 void loop()
 {
     // check serial input
-    if (Serial.available() > 0) {
-        // read byte
-        int c = Serial.read();
+    int available = Serial.available();
+    if (available > 0) {
+        size_t r, l;
 
-        if (c >= 0) {
-            // echo
-            Serial.write(c);
+        if (send_len > 0) {
+            // handle AT+CIPSEND buffer
+            if (available > send_len)
+                l = send_len;
+            else
+                l = available;
 
-            if (send_len > 0) {
-                // at+cipsend
-                send_buffer[send_pos++] = c;
-                send_len--;
+            r = Serial.read(send_buffer + send_pos, l);
 
-                if (send_len == 0) {
-                    client[send_to]->write((uint8_t *)send_buffer, send_pos);
-                    Serial.print(F("\r\nSEND OK\r\n"));
-                    send_pos = 0;
-                    send_to = -1;
-                }
-            } else {
-                // at command
-                input_buffer[input_pos++] = c;
+            if (r > 0) {
+                send_pos += r;
+                send_len -= r;
+            }
 
-                // check EOL
-                if (c == '\n') {
-                    size_t size = input_pos - 1;
+            // entire buffer was read
+            if (send_len == 0) {
+                client[send_to]->write((uint8_t *)send_buffer, send_pos);
+                Serial.print(F("\r\nSEND OK\r\n"));
+                send_pos = 0;
+                send_to = -1;
+            }
+        } else {
+            // handle AT command buffer
+            if (available > input_len)
+                l = input_len;
+            else
+                l = available;
 
-                    if (size > 0 && input_buffer[size - 1] == '\r')
-                        size--;
+            r = Serial.read(input_buffer + input_pos, l);
 
-                    input_buffer[size] = '\0';
-                    process_command(input_buffer, size);
-                    input_pos = 0;
-                }
+            if (r > 0) {
+                Serial.write(input_buffer + input_pos, r);
+                input_pos += r;
+                input_len -= r;
+            }
 
-                // check buffer overflow
-                if (input_pos >= (int)sizeof(input_buffer))
-                    input_pos = 0;
+            // entire command was read
+            if (input_pos > 0 && input_buffer[input_pos - 1] == '\n') {
+                l = input_pos - 1;
+
+                if (l > 0 && input_buffer[l - 1] == '\r')
+                    l--;
+
+                input_buffer[l] = '\0';
+                process_command(input_buffer, l);
+                input_len = sizeof(input_buffer);
+                input_pos = 0;
+            }
+
+            // input buffer overflow
+            if (input_len == 0) {
+                input_len = sizeof(input_buffer);
+                input_pos = 0;
             }
         }
     }
@@ -530,8 +550,7 @@ void loop()
 
     // check connected clients
     for (int i = 0 ; i < MAX_CLIENTS; i++) {
-        int available;
-        int len;
+        int l;
 
         // empty slot
         if (client[i] == nullptr)
@@ -561,9 +580,9 @@ void loop()
         if (available > (int)sizeof(buffer))
             available = sizeof(buffer);
 
-        len = client[i]->read((uint8_t *)buffer, available);
-        Serial.printf("+IPD,%d,%d:", i, len);
-        Serial.write(buffer, len);
+        l = client[i]->read((uint8_t *)buffer, available);
+        Serial.printf("+IPD,%d,%d:", i, l);
+        Serial.write(buffer, l);
         Serial.print(F("\r\nOK\r\n"));
     }
 
