@@ -365,7 +365,7 @@ static void process_command(char *command, size_t len)
             return;
         }
 
-        if (len > (int)sizeof(send_buffer)) {
+        if (l > (int)sizeof(send_buffer)) {
             Serial.print(F("too long\r\n"));
             return;
         }
